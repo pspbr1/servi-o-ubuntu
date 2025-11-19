@@ -1,559 +1,468 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# setup_all.sh - Configurador completo para Ubuntu 24.04 (virtualizado)
+# Uso: sudo ./setup_all.sh
+# Atenção: execute apenas em uma VM/instância de teste. Testado para fluxo genérico.
+set -euo pipefail
+IFS=$'\n\t'
 
-# Script de Instalação Básica - Servidor Ubuntu 24.04 Virtualizado
-# Topologia: NAT (enp0s3) + Rede Interna (enp0s8)
-# Serviços: Email, Proxy, Web, DB, DHCP, NAT/Roteamento, Arquivos
-# Autor: Configuração Automatizada
-# Data: 2025
+LOG="/var/log/setup_all.log"
+exec 3>&1 1>>"${LOG}" 2>&1
 
-set -e
-
-# Cores para output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-# Função para log
-log() {
-    echo -e "${GREEN}[$(date +'%Y-%m-%d %H:%M:%S')]${NC} $1"
-}
-
-error() {
-    echo -e "${RED}[ERRO]${NC} $1"
-    exit 1
-}
-
-warning() {
-    echo -e "${YELLOW}[AVISO]${NC} $1"
-}
-
+# ---------------------------
+# Helpers
+# ---------------------------
 info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
+  echo "[INFO] $*" | tee /dev/fd/3
+}
+warn() {
+  echo "[WARN] $*" | tee /dev/fd/3
+}
+error() {
+  echo "[ERROR] $*" | tee /dev/fd/3
+  exit 1
+}
+check_root() {
+  if [ "$(id -u)" -ne 0 ]; then
+    error "Execute como root (sudo)."
+  fi
+}
+apt_install() {
+  PACKS=("$@")
+  DEBIAN_FRONTEND=noninteractive apt-get install -y "${PACKS[@]}" || error "Falha ao instalar: ${PACKS[*]}"
+}
+service_enable_start() {
+  systemctl enable --now "$1" || error "Falha ao habilitar/iniciar $1"
 }
 
-# Verificar se é root
-if [[ $EUID -ne 0 ]]; then
-   error "Este script precisa ser executado como root (sudo)"
-fi
+# ---------------------------
+# Parâmetros (editáveis)
+# ---------------------------
+INTERNAL_IFACE="enp0s8"   # interface da rede interna (servidor)
+NAT_IFACE="enp0s3"        # interface NAT (recebe internet)
+SERVER_IP="192.168.0.1"
+NETMASK="255.255.255.0"
+NETWORK_CIDR="192.168.0.0/24"
+DNS_SERVER="1.1.1.1"
 
-log "Iniciando configuração do servidor..."
-
-# ============================================
-# CONFIGURAÇÕES - PERSONALIZE AQUI
-# ============================================
-
-DOMAIN="empresa.local"
-HOSTNAME_SERVER="servidor"
-
-# Interfaces de rede
-IFACE_NAT="enp0s3"        # Interface NAT (WAN)
-IFACE_LAN="enp0s8"        # Interface Rede Interna (LAN)
-
-# Rede Interna
-LAN_IP="192.168.0.1"
-LAN_NETMASK="24"
-LAN_NETWORK="192.168.0.0/24"
 DHCP_RANGE_START="192.168.0.100"
 DHCP_RANGE_END="192.168.0.200"
+DHCP_LEASE_TIME="12h"
 
-# Senhas
-MYSQL_ROOT_PASSWORD="123"
-PHPMYADMIN_PASSWORD="123"
-EMAIL_USER_PASSWORD="123"
+MAIL_USER="user1"
+MAIL_PASS=""  # se vazio será gerado
+MYSQL_ROOT_PASS="" # se vazio será gerado
+PHPMYADMIN_PASS="" # se vazio será gerado
 
-# ============================================
-# 1. ATUALIZAÇÃO DO SISTEMA
-# ============================================
+SQUID_BLOCKLIST="/etc/squid/blocked_sites.acl"
+NFS_SHARE_DIR="/srv/share"
 
-log "Atualizando sistema..."
-export DEBIAN_FRONTEND=noninteractive
-apt update
-apt upgrade -y
-apt install -y vim curl wget net-tools iproute2 iptables-persistent
+# ---------------------------
+# Preparação e validações
+# ---------------------------
+check_root
+info "Iniciando configuração — logs em ${LOG}"
+date | tee -a "${LOG}"
 
-# ============================================
-# 2. CONFIGURAÇÃO DE HOSTNAME
-# ============================================
+# Gerar senhas se não fornecidas
+random_pass() {
+  < /dev/urandom tr -dc 'A-Za-z0-9!@#$%&*()_+-=' | head -c16 || echo "Passw0rd123!"
+}
+if [ -z "$MAIL_PASS" ]; then MAIL_PASS="$(random_pass)"; fi
+if [ -z "$MYSQL_ROOT_PASS" ]; then MYSQL_ROOT_PASS="$(random_pass)"; fi
+if [ -z "$PHPMYADMIN_PASS" ]; then PHPMYADMIN_PASS="$(random_pass)"; fi
 
-log "Configurando hostname..."
-hostnamectl set-hostname ${HOSTNAME_SERVER}
-echo "127.0.1.1    ${HOSTNAME_SERVER}.${DOMAIN} ${HOSTNAME_SERVER}" >> /etc/hosts
+info "Senhas geradas (anote):"
+echo " - MAIL user:${MAIL_USER} pass:${MAIL_PASS}" | tee /dev/fd/3
+echo " - MySQL root: ${MYSQL_ROOT_PASS}" | tee /dev/fd/3
+echo " - phpMyAdmin app pass: ${PHPMYADMIN_PASS}" | tee /dev/fd/3
 
-# ============================================
-# 3. CONFIGURAÇÃO DE REDE COM NETPLAN
-# ============================================
+# Atualizar repositório
+info "Atualizando apt..."
+apt-get update -y || error "apt-get update falhou"
+apt-get upgrade -y || error "apt-get upgrade falhou"
 
-log "Configurando interfaces de rede com Netplan..."
-
-# Backup
-cp -r /etc/netplan /etc/netplan.backup.$(date +%Y%m%d_%H%M%S) 2>/dev/null || true
-
-# Remover configurações antigas
-rm -f /etc/netplan/*.yaml
-
-# Criar nova configuração
-cat > /etc/netplan/00-installer-config.yaml <<EOF
+# ---------------------------
+# 1) Netplan: configurar interfaces
+# ---------------------------
+info "Configurando netplan (interfaces: ${NAT_IFACE}=dhcp, ${INTERNAL_IFACE}=${SERVER_IP}/24)..."
+NETPLAN_FILE="/etc/netplan/99-internal.yaml"
+cat > "${NETPLAN_FILE}" <<EOF
 network:
   version: 2
   renderer: networkd
   ethernets:
-    ${IFACE_NAT}:
+    ${NAT_IFACE}:
       dhcp4: true
-      dhcp4-overrides:
-        use-dns: true
-        use-routes: true
-      optional: true
-    
-    ${IFACE_LAN}:
-      addresses:
-        - ${LAN_IP}/${LAN_NETMASK}
+    ${INTERNAL_IFACE}:
+      addresses: [${SERVER_IP}/24]
       dhcp4: no
-      optional: false
+      nameservers:
+        addresses: [${DNS_SERVER}]
 EOF
 
-chmod 600 /etc/netplan/00-installer-config.yaml
+info "Aplicando netplan..."
+netplan apply || error "Falha ao aplicar netplan. Verifique interfaces names (enp0s3/enp0s8)."
 
-# Aplicar configuração
-netplan apply
-sleep 3
+# Basic check network
+ip -4 addr show "${INTERNAL_IFACE}" | grep -q "${SERVER_IP}" || warn "Atenção: IP interno ${SERVER_IP} não aparece em ${INTERNAL_IFACE}."
 
-log "Configuração de rede aplicada"
-log "  • ${IFACE_NAT}: DHCP (NAT/WAN)"
-log "  • ${IFACE_LAN}: ${LAN_IP}/${LAN_NETMASK} (LAN)"
+# ---------------------------
+# 2) Instalar pacotes essenciais
+# ---------------------------
+info "Instalando pacotes essenciais..."
+DEBIAN_FRONTEND=noninteractive apt-get install -y software-properties-common apt-transport-https ca-certificates gnupg lsb-release curl || error "Falha ao instalar pacotes base"
 
-# ============================================
-# 4. HABILITAR ROTEAMENTO E NAT
-# ============================================
-
-log "Configurando NAT e roteamento..."
-
-# Habilitar IP Forward
-sed -i 's/#net.ipv4.ip_forward=1/net.ipv4.ip_forward=1/' /etc/sysctl.conf
-sysctl -p
-
-# Configurar iptables para NAT
-iptables -t nat -A POSTROUTING -o ${IFACE_NAT} -j MASQUERADE
-iptables -A FORWARD -i ${IFACE_LAN} -o ${IFACE_NAT} -j ACCEPT
-iptables -A FORWARD -i ${IFACE_NAT} -o ${IFACE_LAN} -m state --state RELATED,ESTABLISHED -j ACCEPT
-
-# Salvar regras iptables
-netfilter-persistent save
-
-log "NAT e roteamento configurados"
-
-# ============================================
-# 5. INSTALAÇÃO E CONFIGURAÇÃO DO DHCP
-# ============================================
-
-log "Instalando servidor DHCP..."
-apt install -y isc-dhcp-server
-
-# Configurar interface do DHCP
-cat > /etc/default/isc-dhcp-server <<EOF
-INTERFACESv4="${IFACE_LAN}"
-INTERFACESv6=""
+info "Instalando serviços: postfix, dovecot, isc-dhcp-server, squid, apache2, mysql-server, phpmyadmin, nfs-kernel-server, mailutils (utilitários)"
+# Preseed phpmyadmin to avoid interactive prompt
+debconf-set-selections <<EOF
+phpmyadmin phpmyadmin/dbconfig-install boolean true
+phpmyadmin phpmyadmin/app-password-confirm password ${PHPMYADMIN_PASS}
+phpmyadmin phpmyadmin/mysql/admin-pass password ${MYSQL_ROOT_PASS}
+phpmyadmin phpmyadmin/mysql/app-pass password ${PHPMYADMIN_PASS}
+phpmyadmin phpmyadmin/reconfigure-webserver multiselect apache2
 EOF
 
-# Configurar DHCP
-cat > /etc/dhcp/dhcpd.conf <<EOF
-# Configuração DHCP Server
-option domain-name "${DOMAIN}";
-option domain-name-servers ${LAN_IP};
+# Preseed postfix basic configuration for 'Internet Site'
+debconf-set-selections <<EOF
+postfix postfix/main_mailer_type select Internet Site
+postfix postfix/mailname string localdomain
+EOF
+
+# Install packages
+apt_install postfix dovecot-imapd dovecot-pop3d dovecot-lmtpd isc-dhcp-server squid apache2 mysql-server phpmyadmin nfs-kernel-server mailutils
+
+# ---------------------------
+# 3) Configurar UFW + NAT (iptables via UFW)
+# ---------------------------
+info "Configurando UFW e NAT/forwarding..."
+# Allow required ports on internal interface only where applicable
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+
+# Allow SSH globally (you might restrict to NAT IP later)
+ufw allow ssh
+
+# Services to allow: HTTP, HTTPS, SMTP, IMAP, POP3, DNS if needed, NFS? We'll allow internal net to necessary ports.
+ufw allow in on ${INTERNAL_IFACE} to any port 53 proto udp comment 'Allow DNS from internal (if needed)'
+ufw allow in on ${INTERNAL_IFACE} to any port 80 comment 'HTTP on internal'
+ufw allow in on ${INTERNAL_IFACE} to any port 443 comment 'HTTPS on internal'
+ufw allow in on ${INTERNAL_IFACE} to any port 25 comment 'SMTP postfix'
+ufw allow in on ${INTERNAL_IFACE} to any port 143 comment 'IMAP (dovecot)'
+ufw allow in on ${INTERNAL_IFACE} to any port 110 comment 'POP3 (dovecot)'
+ufw allow in on ${INTERNAL_IFACE} to any port 3306 comment 'MySQL (if you want remote access - generally not recommended)'
+# Allow squid (default port 3128) from internal
+ufw allow in on ${INTERNAL_IFACE} to any port 3128 comment 'Squid proxy'
+# Allow NFS (2049) from internal
+ufw allow in on ${INTERNAL_IFACE} to any port 2049 comment 'NFS'
+
+# Enable IPv4 forwarding in sysctl
+sysctl_file="/etc/sysctl.d/99-forward.conf"
+echo "net.ipv4.ip_forward=1" > "${sysctl_file}"
+sysctl --system || warn "Falha ao recarregar sysctl, mas prosseguindo."
+
+# Configure UFW to allow forwarding and masquerade (edit /etc/ufw/before.rules)
+UFW_BEFORE="/etc/ufw/before.rules"
+# Ensure we only add once
+if ! grep -q "### NAT RULES START" "${UFW_BEFORE}"; then
+  info "Adicionando regras de masquerade ao ${UFW_BEFORE}"
+  # Insert at top before *filter rule — safer to append at beginning
+  awk -v nat_iface="${NAT_IFACE}" -v int_iface="${INTERNAL_IFACE}" 'BEGIN{added=0}{
+    print 
+    if($0 ~ "COMMIT" && !added){
+      # before commit, add nat table if not present (we place just before COMMIT of filter; safe enough)
+    }
+  }' "${UFW_BEFORE}" > "${UFW_BEFORE}.new" || true
+
+  # We'll construct a snippet and prepend to the file to ensure nat applied
+  cat > /tmp/ufw_nat_snippet <<EOF
+# ### NAT RULES START (added by setup_all.sh)
+*nat
+:POSTROUTING ACCEPT [0:0]
+-A POSTROUTING -s ${NETWORK_CIDR} -o ${NAT_IFACE} -j MASQUERADE
+COMMIT
+# Allow forwarding (filter) - ensure forwarding policy by UFW will permit established
+# ### NAT RULES END
+EOF
+  # Prepend snippet to before.rules
+  cat /tmp/ufw_nat_snippet "${UFW_BEFORE}" > "${UFW_BEFORE}.patched"
+  mv "${UFW_BEFORE}.patched" "${UFW_BEFORE}"
+  rm -f /tmp/ufw_nat_snippet
+else
+  info "Regras de NAT já presentes em ${UFW_BEFORE}"
+fi
+
+# Allow forwarding in UFW configuration (DEFAULT_FORWARD_POLICY)
+if ! grep -q '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw; then
+  sed -i 's/^#DEFAULT_FORWARD_POLICY="DROP"/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw || true
+  # if not present, add
+  if ! grep -q '^DEFAULT_FORWARD_POLICY=' /etc/default/ufw; then
+    echo 'DEFAULT_FORWARD_POLICY="ACCEPT"' >> /etc/default/ufw
+  fi
+else
+  sed -i 's/^DEFAULT_FORWARD_POLICY=.*/DEFAULT_FORWARD_POLICY="ACCEPT"/' /etc/default/ufw
+fi
+
+info "Habilitando UFW..."
+ufw --force enable || error "Falha ao habilitar UFW"
+
+# ---------------------------
+# 4) Configurar NAT (iptables persistente via UFW já feito)
+# Também garantimos regra iptables em runtime (para sessão atual)
+# ---------------------------
+info "Aplicando regra de masquerade em runtime..."
+iptables -t nat -C POSTROUTING -s "${NETWORK_CIDR}" -o "${NAT_IFACE}" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s "${NETWORK_CIDR}" -o "${NAT_IFACE}" -j MASQUERADE
+
+# ---------------------------
+# 5) DHCP server (isc-dhcp-server)
+# ---------------------------
+info "Configurando isc-dhcp-server para ${INTERNAL_IFACE}..."
+DHCP_CONF="/etc/dhcp/dhcpd.conf"
+cat > "${DHCP_CONF}" <<EOF
+option domain-name "localdomain";
+option domain-name-servers ${DNS_SERVER}, 8.8.8.8;
 
 default-lease-time 600;
 max-lease-time 7200;
+
 authoritative;
 
 subnet 192.168.0.0 netmask 255.255.255.0 {
   range ${DHCP_RANGE_START} ${DHCP_RANGE_END};
-  option routers ${LAN_IP};
-  option domain-name-servers ${LAN_IP}, 1.1.1.1;
-  option domain-name "${DOMAIN}";
+  option routers ${SERVER_IP};
+  option broadcast-address 192.168.0.255;
+  option domain-name-servers ${DNS_SERVER};
+  option subnet-mask 255.255.255.0;
+  default-lease-time ${DHCP_LEASE_TIME};
 }
 EOF
 
-systemctl enable isc-dhcp-server
-systemctl restart isc-dhcp-server
+# Configure isc-dhcp-server to listen on internal iface
+sed -i "s/^INTERFACESv4=.*/INTERFACESv4=\"${INTERNAL_IFACE}\"/" /etc/default/isc-dhcp-server || echo "INTERFACESv4=\"${INTERNAL_IFACE}\"" >> /etc/default/isc-dhcp-server
 
-log "DHCP Server configurado (${DHCP_RANGE_START} - ${DHCP_RANGE_END})"
+service_enable_start isc-dhcp-server
 
-# ============================================
-# 6. INSTALAÇÃO DO APACHE WEB SERVER
-# ============================================
+# ---------------------------
+# 6) Squid - proxy com bloqueio
+# ---------------------------
+info "Configurando Squid..."
+SQUID_CONF="/etc/squid/squid.conf"
+# Backup
+cp -n "${SQUID_CONF}" "${SQUID_CONF}.orig" || true
 
-log "Instalando Apache Web Server..."
-apt install -y apache2
+cat > "${SQUID_BLOCKLIST}" <<EOF
+# Domínios a bloquear - adicione um por linha (sem protocolo)
+facebook.com
+youtube.com
+twitter.com
+EOF
 
-systemctl enable apache2
-systemctl start apache2
+cat > "${SQUID_CONF}" <<EOF
+# Squid configurado por setup_all.sh
+http_port 3128
+acl localnet src ${NETWORK_CIDR}
+acl Safe_ports port 80      # http
+acl Safe_ports port 443     # https
+acl CONNECT method CONNECT
 
-# Página básica de teste
-echo "<h1>Servidor ${HOSTNAME_SERVER}.${DOMAIN}</h1><p>Servidor configurado com sucesso!</p>" > /var/www/html/index.html
+# blocked sites
+acl blocked_sites dstdomain "/etc/squid/blocked_sites.acl"
 
-log "Apache configurado - http://${LAN_IP}"
+# http access rules
+http_access deny blocked_sites
+http_access allow localnet
+http_access deny all
 
-# ============================================
-# 7. INSTALAÇÃO DO MYSQL
-# ============================================
+# logging & options
+access_log /var/log/squid/access.log
+cache_dir ufs /var/spool/squid 100 16 256
+coredump_dir /var/spool/squid
+EOF
 
-log "Instalando MySQL Server..."
-apt install -y mysql-server
+chown proxy:proxy "${SQUID_BLOCKLIST}"
+systemctl restart squid || error "Falha ao reiniciar squid"
 
-systemctl enable mysql
-systemctl start mysql
-
-# Configurar MySQL
-mysql <<EOF
-ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASSWORD}';
-DELETE FROM mysql.user WHERE User='';
-DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+# ---------------------------
+# 7) Apache + MySQL + phpMyAdmin
+# ---------------------------
+info "Configurando MySQL root password e criando usuário de teste..."
+# Secure installation minimal: set root password and remove anonymous, test db, remote root
+# Use mysql shell to set password
+mysql_install_secure() {
+  mysql -uroot <<SQL || return 1
+ALTER USER 'root'@'localhost' IDENTIFIED WITH mysql_native_password BY '${MYSQL_ROOT_PASS}';
+FLUSH PRIVILEGES;
+DELETE FROM mysql.user WHERE user='';
 DROP DATABASE IF EXISTS test;
 DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
 FLUSH PRIVILEGES;
-EOF
+SQL
+}
+mysql_install_secure || warn "Aviso: falha ao aplicar mysql_secure_installation automatizado."
 
-log "MySQL configurado"
+# Ensure Apache has phpmyadmin conf included (phpmyadmin package should have installed)
+a2enmod php || true
+systemctl restart apache2 || warn "Falha ao reiniciar apache2"
 
-# ============================================
-# 8. INSTALAÇÃO DO PHPMYADMIN
-# ============================================
-
-log "Instalando phpMyAdmin..."
-echo "phpmyadmin phpmyadmin/dbconfig-install boolean true" | debconf-set-selections
-echo "phpmyadmin phpmyadmin/app-password-confirm password ${PHPMYADMIN_PASSWORD}" | debconf-set-selections
-echo "phpmyadmin phpmyadmin/mysql/admin-pass password ${MYSQL_ROOT_PASSWORD}" | debconf-set-selections
-echo "phpmyadmin phpmyadmin/mysql/app-pass password ${PHPMYADMIN_PASSWORD}" | debconf-set-selections
-echo "phpmyadmin phpmyadmin/reconfigure-webserver multiselect apache2" | debconf-set-selections
-
-apt install -y phpmyadmin php-mbstring php-zip php-gd php-json php-curl
-
-phpenmod mbstring
-systemctl reload apache2
-
-log "phpMyAdmin instalado - http://${LAN_IP}/phpmyadmin"
-
-# ============================================
-# 9. INSTALAÇÃO DO POSTFIX (SMTP)
-# ============================================
-
-log "Instalando Postfix..."
-echo "postfix postfix/mailname string ${DOMAIN}" | debconf-set-selections
-echo "postfix postfix/main_mailer_type string 'Internet Site'" | debconf-set-selections
-
-apt install -y postfix mailutils
-
-# Configurar Postfix
-postconf -e "myhostname = ${HOSTNAME_SERVER}.${DOMAIN}"
-postconf -e "mydomain = ${DOMAIN}"
-postconf -e "myorigin = \$mydomain"
+# ---------------------------
+# 8) Postfix + Dovecot (email)
+# ---------------------------
+info "Configurando Postfix para entrega em Maildir e Dovecot para IMAP/POP3..."
+# Postfix main.cf minimal changes
+postconf -e "myhostname = ${HOSTNAME:-localhost}"
+postconf -e "mydestination = localhost, ${HOSTNAME:-localhost}"
 postconf -e "inet_interfaces = all"
-postconf -e "mydestination = \$myhostname, localhost.\$mydomain, localhost, \$mydomain"
+postconf -e "mynetworks = 127.0.0.0/8, ${NETWORK_CIDR}"
 postconf -e "home_mailbox = Maildir/"
-postconf -e "mynetworks = 127.0.0.0/8, ${LAN_NETWORK}"
+postconf -e "smtpd_banner = \$myhostname ESMTP"
+postconf -e "compatibility_level = 2"
 
-systemctl enable postfix
-systemctl restart postfix
-
-log "Postfix configurado"
-
-# ============================================
-# 10. INSTALAÇÃO DO DOVECOT (IMAP/POP3)
-# ============================================
-
-log "Instalando Dovecot..."
-apt install -y dovecot-core dovecot-imapd dovecot-pop3d
-
-# Configurar Dovecot
-sed -i 's/#listen = \*, ::/listen = */' /etc/dovecot/dovecot.conf
-sed -i 's|mail_location = .*|mail_location = maildir:~/Maildir|' /etc/dovecot/conf.d/10-mail.conf
-sed -i 's/disable_plaintext_auth = yes/disable_plaintext_auth = no/' /etc/dovecot/conf.d/10-auth.conf
-
-systemctl enable dovecot
-systemctl restart dovecot
-
-log "Dovecot configurado"
-
-# ============================================
-# 11. CRIAR USUÁRIO DE EMAIL
-# ============================================
-
-log "Criando usuário de email: aluno"
-useradd -m -s /bin/bash aluno
-echo "aluno:${EMAIL_USER_PASSWORD}" | chpasswd
-mkdir -p /home/aluno/Maildir/{new,cur,tmp}
-chown -R aluno:aluno /home/aluno/Maildir
-chmod -R 700 /home/aluno/Maildir
-
-log "Usuário criado: aluno@${DOMAIN} / ${EMAIL_USER_PASSWORD}"
-
-# ============================================
-# 12. INSTALAÇÃO DO SQUID PROXY
-# ============================================
-
-log "Instalando Squid Proxy..."
-apt install -y squid
-
-# Backup
-cp /etc/squid/squid.conf /etc/squid/squid.conf.bak
-
-# Criar lista de sites bloqueados
-cat > /etc/squid/blocked_sites.acl <<EOF
-# Sites bloqueados
-.facebook.com
-.twitter.com
-.instagram.com
-.tiktok.com
-.youtube.com
+# Dovecot main settings
+DOVECOT_CONF="/etc/dovecot/dovecot.conf"
+cat > /etc/dovecot/conf.d/10-mail.conf <<EOF
+mail_location = maildir:~/Maildir
+mail_privileged_group = mail
 EOF
 
-# Configurar Squid
-cat > /etc/squid/squid.conf <<EOF
-# Porta do Squid
-http_port 3128
-
-# ACLs
-acl localhost src 127.0.0.1/32
-acl localnet src ${LAN_NETWORK}
-
-acl SSL_ports port 443
-acl Safe_ports port 80          # HTTP
-acl Safe_ports port 21          # FTP
-acl Safe_ports port 443         # HTTPS
-acl Safe_ports port 70          # Gopher
-acl Safe_ports port 210         # WAIS
-acl Safe_ports port 1025-65535  # portas altas
-acl Safe_ports port 280         # http-mgmt
-acl Safe_ports port 488         # gss-http
-acl Safe_ports port 591         # filemaker
-acl Safe_ports port 777         # multiling http
-
-acl CONNECT method CONNECT
-
-# Sites bloqueados
-acl blocked_sites dstdomain "/etc/squid/blocked_sites.acl"
-
-# Regras de bloqueio
-http_access deny blocked_sites
-
-# Regras de acesso
-http_access deny !Safe_ports
-http_access deny CONNECT !SSL_ports
-http_access allow localhost manager
-http_access deny manager
-http_access allow localnet
-http_access allow localhost
-http_access deny all
-
-# Configurações de cache
-cache_dir ufs /var/spool/squid 100 16 256
-coredump_dir /var/spool/squid
-cache_mem 256 MB
-maximum_object_size 10 MB
-
-# Logs
-access_log /var/log/squid/access.log squid
-cache_log /var/log/squid/cache.log
-
-# Hostname
-visible_hostname ${HOSTNAME_SERVER}.${DOMAIN}
+cat > /etc/dovecot/conf.d/10-master.conf <<'EOF'
+service imap-login {
+  inet_listener imap {
+    port = 143
+  }
+}
+service pop3-login {
+  inet_listener pop3 {
+    port = 110
+  }
+}
+service lmtp {
+  unix_listener /var/spool/postfix/private/dovecot-lmtp {
+    mode = 0600
+    user = postfix
+    group = postfix
+  }
+}
 EOF
 
-# Inicializar cache do Squid
-squid -z
-
-systemctl enable squid
-systemctl restart squid
-
-log "Squid Proxy configurado com bloqueio de sites"
-log "  • Proxy: ${LAN_IP}:3128"
-
-# ============================================
-# 13. INSTALAÇÃO DO SAMBA (Servidor de Arquivos)
-# ============================================
-
-log "Instalando Samba..."
-apt install -y samba samba-common-bin
-
-# Backup
-cp /etc/samba/smb.conf /etc/samba/smb.conf.bak
-
-# Criar diretórios compartilhados
-mkdir -p /srv/samba/publico
-mkdir -p /srv/samba/privado
-chmod 777 /srv/samba/publico
-chmod 770 /srv/samba/privado
-chown -R aluno:aluno /srv/samba/privado
-
-# Configurar Samba
-cat > /etc/samba/smb.conf <<EOF
-[global]
-   workgroup = WORKGROUP
-   server string = Servidor de Arquivos - ${DOMAIN}
-   netbios name = ${HOSTNAME_SERVER}
-   security = user
-   map to guest = bad user
-   dns proxy = no
-   interfaces = ${LAN_IP}/24 127.0.0.1
-   bind interfaces only = yes
-   
-   log file = /var/log/samba/log.%m
-   max log size = 1000
-
-[Publico]
-   comment = Compartilhamento Público
-   path = /srv/samba/publico
-   browseable = yes
-   writable = yes
-   guest ok = yes
-   read only = no
-   create mask = 0777
-   directory mask = 0777
-   force user = nobody
-
-[Privado]
-   comment = Compartilhamento Privado
-   path = /srv/samba/privado
-   browseable = yes
-   writable = yes
-   guest ok = no
-   valid users = aluno
-   read only = no
-   create mask = 0770
-   directory mask = 0770
+# Auth: use system users (PAM)
+cat > /etc/dovecot/conf.d/10-auth.conf <<EOF
+disable_plaintext_auth = no
+auth_mechanisms = plain login
+!include auth-system.conf.ext
 EOF
 
-# Configurar senha do Samba para o usuário
-(echo "${EMAIL_USER_PASSWORD}"; echo "${EMAIL_USER_PASSWORD}") | smbpasswd -a aluno -s
+# Ensure permissions and restart
+service_enable_start postfix
+service_enable_start dovecot
 
-systemctl enable smbd
-systemctl enable nmbd
-systemctl restart smbd
-systemctl restart nmbd
+# Create mail test user
+if ! id -u "${MAIL_USER}" >/dev/null 2>&1; then
+  info "Criando usuário de email ${MAIL_USER}..."
+  useradd -m -s /bin/bash "${MAIL_USER}" || error "Falha ao criar usuário ${MAIL_USER}"
+  echo "${MAIL_USER}:${MAIL_PASS}" | chpasswd || warn "Falha ao definir senha de ${MAIL_USER}"
+  # create Maildir
+  su - "${MAIL_USER}" -c 'maildirmake Maildir || true' || true
+else
+  warn "Usuário ${MAIL_USER} já existe; não criado"
+fi
 
-log "Samba configurado"
-log "  • Público: //${LAN_IP}/Publico (sem senha)"
-log "  • Privado: //${LAN_IP}/Privado (aluno/${EMAIL_USER_PASSWORD})"
+# ---------------------------
+# 9) NFS (serviço de arquivos)
+# ---------------------------
+info "Configurando NFS export em ${NFS_SHARE_DIR}..."
+mkdir -p "${NFS_SHARE_DIR}"
+chown nobody:nogroup "${NFS_SHARE_DIR}"
+chmod 2775 "${NFS_SHARE_DIR}"
 
-# ============================================
-# 14. CONFIGURAÇÃO DO FIREWALL
-# ============================================
+# Create a sample file to indicate share
+echo "Pasta compartilhada NFS em $(date) - servidor ${SERVER_IP}" > "${NFS_SHARE_DIR}/README.txt"
 
-log "Configurando firewall..."
-apt install -y ufw
+# Add export
+EXPORTS="/etc/exports"
+if ! grep -q "^${NFS_SHARE_DIR} " "${EXPORTS}"; then
+  echo "${NFS_SHARE_DIR} ${NETWORK_CIDR}(rw,sync,no_subtree_check,no_root_squash)" >> "${EXPORTS}"
+fi
+exportfs -ra || warn "exportfs -ra falhou (verifique /etc/exports)."
+service_enable_start nfs-server
 
-# Configurar UFW
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
-ufw default allow routed
+# ---------------------------
+# 10) Final adjustments and service checks
+# ---------------------------
+info "Verificando status dos serviços principais..."
+SERVICES=(isc-dhcp-server squid apache2 mysql postfix dovecot nfs-server)
+for s in "${SERVICES[@]}"; do
+  systemctl is-active --quiet "$s" && info "$s ativo" || warn "$s NÃO ATIVO (verifique logs)"
+done
 
-# Permitir SSH
-ufw allow 22/tcp
+# Show UFW status
+info "UFW status:"
+ufw status verbose | tee /dev/fd/3
 
-# Permitir serviços na LAN
-ufw allow in on ${IFACE_LAN} to any port 80 proto tcp    # HTTP
-ufw allow in on ${IFACE_LAN} to any port 443 proto tcp   # HTTPS
-ufw allow in on ${IFACE_LAN} to any port 25 proto tcp    # SMTP
-ufw allow in on ${IFACE_LAN} to any port 110 proto tcp   # POP3
-ufw allow in on ${IFACE_LAN} to any port 143 proto tcp   # IMAP
-ufw allow in on ${IFACE_LAN} to any port 3128 proto tcp  # Squid
-ufw allow in on ${IFACE_LAN} to any port 3306 proto tcp  # MySQL
-ufw allow in on ${IFACE_LAN} to any port 139 proto tcp   # Samba
-ufw allow in on ${IFACE_LAN} to any port 445 proto tcp   # Samba
-ufw allow in on ${IFACE_LAN} to any port 137 proto udp   # Samba
-ufw allow in on ${IFACE_LAN} to any port 138 proto udp   # Samba
-ufw allow in on ${IFACE_LAN} to any port 67 proto udp    # DHCP
-ufw allow in on ${IFACE_LAN} to any port 53              # DNS
+# Show netstat/listening ports relevant
+info "Portas abertas (grep dos principais serviços):"
+ss -tulwn | egrep ':80|:443|:25|:3128|:143|:110|:3306|:2049' | tee /dev/fd/3 || true
 
-echo "y" | ufw enable
+# ---------------------------
+# 11) Output resumo e instruções para o cliente Zorin
+# ---------------------------
+cat > /dev/fd/3 <<EOF
+==========================================
+CONFIGURAÇÃO FINALIZADA
+- Server internal IP: ${SERVER_IP}
+- DNS: ${DNS_SERVER}
+- DHCP range: ${DHCP_RANGE_START} - ${DHCP_RANGE_END}
+- Mail user: ${MAIL_USER} / ${MAIL_PASS}
+- MySQL root: ${MYSQL_ROOT_PASS}
+- phpMyAdmin app password: ${PHPMYADMIN_PASS}
 
-log "Firewall configurado"
+Serviços instalados:
+ - isc-dhcp-server (escutando em ${INTERNAL_IFACE})
+ - squid (proxy porta 3128, ACLs em ${SQUID_BLOCKLIST})
+ - apache2 + phpmyadmin (web: http://${SERVER_IP}/phpmyadmin)
+ - mysql-server (bind em localhost por padrão)
+ - postfix + dovecot (SMTP 25, IMAP 143, POP3 110)
+ - nfs-server (share ${NFS_SHARE_DIR})
 
-# ============================================
-# 15. INFORMAÇÕES FINAIS
-# ============================================
+Notas importantes de segurança e uso:
+ - MySQL está com root password definido, verifique / altere conforme necessário.
+ - phpMyAdmin está instalado e integrado ao Apache: use com cuidado (mantenha firewall).
+ - Dovecot aceita autenticação plaintext (disable_plaintext_auth = no) porque é uma rede interna. Para produção, use TLS (STARTTLS) e certificados.
+ - Squid bloqueia domínios listados em ${SQUID_BLOCKLIST}. Edite esse arquivo para adicionar mais.
+ - UFW foi habilitado e configurado. Se precisar abrir outras portas, use 'ufw allow in on ${INTERNAL_IFACE} to any port <porta>'.
 
-# Salvar informações
-cat > /root/servidor_config.txt <<EOF
-===========================================
-CONFIGURAÇÃO DO SERVIDOR - $(date)
-===========================================
+Instrução rápida para o cliente Zorin (exemplo netplan):
+------------------------------------------
+# /etc/netplan/01-internal.yaml (exemplo para cliente)
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    enp0s3:    # ou o nome que sua VM Zorin mostra
+      dhcp4: true
+# OU para usar IP estático:
+#    enp0s3:
+#      addresses: [192.168.0.50/24]
+#      gateway4: ${SERVER_IP}
+#      nameservers:
+#        addresses: [${DNS_SERVER}]
+------------------------------------------
 
-HOSTNAME: ${HOSTNAME_SERVER}.${DOMAIN}
+Como testar:
+ - No cliente Zorin (DHCP), confirme que recebeu IP na faixa .100-.200 e gateway ${SERVER_IP}.
+ - Teste internet (ping 8.8.8.8). Deve funcionar via NAT do host.
+ - Teste proxy: aponte browser/CLI para proxy ${SERVER_IP}:3128 (ou use curl --proxy).
+ - Teste IMAP: use 'telnet ${SERVER_IP} 143' ou cliente CLI como 'mutt' apontando para IMAP server ${SERVER_IP}.
+ - Teste NFS: mount ${SERVER_IP}:/srv/share /mnt -v
+ - Teste phpMyAdmin: acesse http://${SERVER_IP}/phpmyadmin no browser do cliente.
 
-INTERFACES DE REDE:
--------------------
-${IFACE_NAT}: DHCP (NAT/Internet)
-${IFACE_LAN}: ${LAN_IP}/${LAN_NETMASK} (Rede Interna)
+Logs importantes:
+ - /var/log/setup_all.log (este script)
+ - /var/log/syslog, /var/log/mail.log, /var/log/squid/access.log, /var/log/apache2/error.log
 
-DHCP SERVER:
-------------
-Range: ${DHCP_RANGE_START} - ${DHCP_RANGE_END}
-Rede: ${LAN_NETWORK}
-Gateway: ${LAN_IP}
-
-SERVIÇOS:
----------
-Web Server: http://${LAN_IP}
-phpMyAdmin: http://${LAN_IP}/phpmyadmin
-  Usuário: root
-  Senha: ${MYSQL_ROOT_PASSWORD}
-
-Email:
-  SMTP: ${LAN_IP}:25
-  IMAP: ${LAN_IP}:143
-  POP3: ${LAN_IP}:110
-  Usuário: aluno@${DOMAIN}
-  Senha: ${EMAIL_USER_PASSWORD}
-  
-Proxy Squid: ${LAN_IP}:3128
-  Sites bloqueados: facebook, twitter, instagram, tiktok, youtube
-
-Samba:
-  Público: //${LAN_IP}/Publico (sem senha)
-  Privado: //${LAN_IP}/Privado
-    Usuário: aluno
-    Senha: ${EMAIL_USER_PASSWORD}
-
-===========================================
+Se quiser: posso gerar um segundo script para o cliente (netplan + comandos úteis), ou adicionar TLS para dovecot/postfix e autenticação segura. 
+==========================================
 EOF
 
-log ""
-log "=========================================="
-log "✅ INSTALAÇÃO CONCLUÍDA COM SUCESSO!"
-log "=========================================="
-log ""
-log "📋 CONFIGURAÇÃO:"
-log "  • Interface LAN: ${IFACE_LAN} - ${LAN_IP}/${LAN_NETMASK}"
-log "  • DHCP: ${DHCP_RANGE_START} - ${DHCP_RANGE_END}"
-log ""
-log "🌐 SERVIÇOS:"
-log "  ✓ Apache: http://${LAN_IP}"
-log "  ✓ phpMyAdmin: http://${LAN_IP}/phpmyadmin"
-log "  ✓ Email: aluno@${DOMAIN}"
-log "  ✓ Proxy: ${LAN_IP}:3128"
-log "  ✓ Samba: //${LAN_IP}/Publico e //${LAN_IP}/Privado"
-log "  ✓ NAT/Roteamento: Ativo"
-log ""
-log "🔑 CREDENCIAIS:"
-log "  • MySQL root: ${MYSQL_ROOT_PASSWORD}"
-log "  • Email aluno: ${EMAIL_USER_PASSWORD}"
-log "  • Samba aluno: ${EMAIL_USER_PASSWORD}"
-log ""
-log "📄 Informações salvas em: /root/servidor_config.txt"
-log "=========================================="
-
-info ""
-info "🔍 Status dos Serviços:"
-systemctl is-active apache2 >/dev/null && echo "  ✓ Apache: Ativo" || echo "  ✗ Apache: Inativo"
-systemctl is-active mysql >/dev/null && echo "  ✓ MySQL: Ativo" || echo "  ✗ MySQL: Inativo"
-systemctl is-active postfix >/dev/null && echo "  ✓ Postfix: Ativo" || echo "  ✗ Postfix: Inativo"
-systemctl is-active dovecot >/dev/null && echo "  ✓ Dovecot: Ativo" || echo "  ✗ Dovecot: Inativo"
-systemctl is-active squid >/dev/null && echo "  ✓ Squid: Ativo" || echo "  ✗ Squid: Inativo"
-systemctl is-active smbd >/dev/null && echo "  ✓ Samba: Ativo" || echo "  ✗ Samba: Inativo"
-systemctl is-active isc-dhcp-server >/dev/null && echo "  ✓ DHCP: Ativo" || echo "  ✗ DHCP: Inativo"
-
-log ""
-log "Script finalizado!"
+# End of script
+info "Fim da execução do script. Verifique logs em ${LOG}."
+exit 0
